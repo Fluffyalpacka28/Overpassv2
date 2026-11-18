@@ -1,0 +1,230 @@
+import * as THREE from 'three';
+
+// Water areas (lakes, ponds, reservoirs, river areas) from OSM ways + multipolygon relations.
+// Segments are bucketed by z so a horizontal ray test only touches nearby edges.
+// Each polygon/relation is its own "group" with even-odd parity, so overlapping
+// water features never cancel each other out.
+const BAND = 16;
+const ROW = 2; // render resolution (m)
+
+export const WATER_TAGS = t => t && (t.natural === 'water' || t.waterway === 'riverbank' || t.landuse === 'reservoir' || t.landuse === 'basin' || t.water);
+
+export class WaterIndex {
+  constructor() { this.bands = new Map(); this.groups = 0; this.ids = new Set(); this.relPending = new Set(); }
+  clear() { this.bands.clear(); this.ids.clear(); this.relPending.clear(); this.groups = 0; }
+  has(key) { return this.ids.has(key); }
+  // rings: array of [[x,z],...] (closed or not). Returns bbox of what was added.
+  addGroup(key, rings) {
+    if (this.ids.has(key)) return null; this.ids.add(key);
+    const g = this.groups++; let x0 = 1e9, x1 = -1e9, z0 = 1e9, z1 = -1e9, n = 0;
+    for (const r of rings) {
+      const L = r.length; if (L < 3) continue;
+      for (let i = 0; i < L; i++) {
+        const a = r[i], b = r[(i + 1) % L]; if (a[1] === b[1]) continue;
+        const seg = [a[0], a[1], b[0], b[1], g]; n++;
+        const lo = Math.floor(Math.min(a[1], b[1]) / BAND), hi = Math.floor(Math.max(a[1], b[1]) / BAND);
+        for (let k = lo; k <= hi; k++) { let l = this.bands.get(k); if (!l) { l = []; this.bands.set(k, l); } l.push(seg); }
+        x0 = Math.min(x0, a[0]); x1 = Math.max(x1, a[0]); z0 = Math.min(z0, a[1]); z1 = Math.max(z1, a[1]);
+      }
+    }
+    return n ? { x0, x1, z0, z1 } : null;
+  }
+  // crossings of the line z=const, grouped -> sorted x lists
+  crossings(z) {
+    const l = this.bands.get(Math.floor(z / BAND)); if (!l) return null; const out = new Map();
+    for (const s of l) {
+      const [ax, az, bx, bz, g] = s; if ((az > z) === (bz > z)) continue;
+      const x = ax + (z - az) / (bz - az) * (bx - ax); let a = out.get(g); if (!a) { a = []; out.set(g, a); } a.push(x);
+    }
+    return out;
+  }
+  inside(x, z) {
+    const c = this.crossings(z); if (!c) return false;
+    for (const xs of c.values()) { let n = 0; for (const v of xs) if (v > x) n++; if (n & 1) return true; }
+    return false;
+  }
+  // union of water intervals along row z, clipped to [xa,xb]
+  intervals(z, xa, xb) {
+    const c = this.crossings(z); if (!c) return [];
+    let iv = [];
+    for (const xs of c.values()) { xs.sort((a, b) => a - b); for (let i = 0; i + 1 < xs.length; i += 2) { const a = Math.max(xa, xs[i]), b = Math.min(xb, xs[i + 1]); if (b > a) iv.push([a, b]); } }
+    if (iv.length < 2) return iv;
+    iv.sort((a, b) => a[0] - b[0]); const m = [iv[0]];
+    for (let i = 1; i < iv.length; i++) { const t = m[m.length - 1]; if (iv[i][0] <= t[1]) t[1] = Math.max(t[1], iv[i][1]); else m.push(iv[i]); }
+    return m;
+  }
+  // build a water surface mesh for a square area.
+  // Every vertex also gets 'shore': roughly how many metres it is from the nearest bank (capped at 12), which the shader uses for shallow colour and foam.
+  geometry(x0, z0, size, y, H = () => 0) {
+    const pos = [], uv = [], sh = [], STEP = 10, CAP = 12, RADII = [2, 4, 6, 8, 12];
+    // vertex rows sit on z0 + k*ROW and every probe distance is a multiple of ROW, so rows are looked up by index
+    const rowArr = [], OFF = 8, rowIv = z => { const k = Math.round((z - z0) / ROW) + OFF; let r = rowArr[k]; if (r === undefined) { r = this.intervals(z, -1e9, 1e9); rowArr[k] = r; } return r; };
+    const wet = (x, z) => { const iv = rowIv(z); for (let i = 0; i < iv.length; i++) if (x >= iv[i][0] && x <= iv[i][1]) return true; return false; };
+    const shore = (x, z) => {
+      const iv = rowIv(z); let d = 0;
+      for (let i = 0; i < iv.length; i++) if (x >= iv[i][0] && x <= iv[i][1]) { d = Math.min(CAP, x - iv[i][0], iv[i][1] - x); break; }
+      for (let i = 0; i < RADII.length; i++) { const r = RADII[i]; if (r >= d) break; if (!wet(x, z - r) || !wet(x, z + r)) { d = r; break; } }
+      return d > 0 ? d : 0;
+    };
+    for (let z = z0; z < z0 + size - 1e-6; z += ROW) {
+      const za = z, zb = z + ROW, iv = this.intervals(z + ROW / 2, x0, x0 + size);
+      for (const [a, b] of iv) {
+        // columns every <= 10 m, plus extra ones 2.5 m in from each end so the foam line stays sharp
+        const xs = [a]; if (b - a > 7) { xs.push(a + 2.5); const n = Math.max(1, Math.ceil((b - a - 5) / STEP)); for (let k = 1; k < n; k++) xs.push(a + 2.5 + (b - a - 5) * k / n); xs.push(b - 2.5); } else { const n = Math.max(1, Math.ceil((b - a) / STEP)); for (let k = 1; k < n; k++) xs.push(a + (b - a) * k / n); }
+        xs.push(b);
+        let s1 = shore(xs[0], za), s2 = shore(xs[0], zb);
+        for (let k = 0; k + 1 < xs.length; k++) {
+          const xa = xs[k], xb = xs[k + 1];
+          const h1 = y + H(xa, za), h2 = y + H(xa, zb), h3 = y + H(xb, zb), h4 = y + H(xb, za);
+          const s3 = shore(xb, zb), s4 = shore(xb, za);
+          pos.push(xa, h1, za, xa, h2, zb, xb, h3, zb, xa, h1, za, xb, h3, zb, xb, h4, za);
+          sh.push(s1, s2, s3, s1, s3, s4);
+          s1 = s4; s2 = s3;
+        }
+      }
+    }
+    if (!pos.length) return null;
+    for (let i = 0; i < pos.length; i += 3) uv.push(pos[i] / 24, pos[i + 2] / 24);
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+    g.setAttribute('shore', new THREE.Float32BufferAttribute(sh, 1));
+    g.computeVertexNormals();
+    return g;
+  }
+}
+
+// Join relation member ways into closed rings via shared node ids
+export function assembleRings(ways) {
+  const segs = ways.filter(w => w.nodes.length >= 2).map(w => ({ nodes: w.nodes.slice(), used: false }));
+  const rings = [];
+  for (const s of segs) {
+    if (s.used) continue; s.used = true; let ring = s.nodes.slice();
+    let guard = 0;
+    while (ring[0] !== ring[ring.length - 1] && guard++ < 5000) {
+      const end = ring[ring.length - 1]; let found = false;
+      for (const o of segs) {
+        if (o.used) continue;
+        if (o.nodes[0] === end) { ring = ring.concat(o.nodes.slice(1)); o.used = found = true; break; }
+        if (o.nodes[o.nodes.length - 1] === end) { ring = ring.concat(o.nodes.slice(0, -1).reverse()); o.used = found = true; break; }
+      }
+      if (!found) break;
+    }
+    if (ring.length >= 4 && ring[0] === ring[ring.length - 1]) rings.push(ring);
+  }
+  return rings;
+}
+
+// ---------- the water surface ----------
+// One shared shader for all water: layered scrolling ripples, Fresnel reflection of the real sky colours,
+// a sun / moon glint, shallow-to-deep colour and lapping foam along the banks. No extra render passes, so it stays cheap on phones.
+let MAT = null, NORM = null;
+const U = {
+  uTime: { value: 0 }, uNorm: { value: null },
+  uSkyTop: { value: new THREE.Color('#3a6fc4') }, uSkyHor: { value: new THREE.Color('#bcd3ea') },
+  uSunDir: { value: new THREE.Vector3(0.4, 0.8, 0.3).normalize() }, uSunCol: { value: new THREE.Color('#fff') },
+  uAmb: { value: new THREE.Color('#fff') }, uDeep: { value: new THREE.Color('#0f3f5c') }, uShallow: { value: new THREE.Color('#2f8f93') },
+  uRough: { value: 1 },
+};
+// tileable ripple normals (rgb) + foam noise (alpha), made once on a canvas
+function normalTexture() {
+  if (NORM) return NORM;
+  const N = 256, hgt = new Float32Array(N * N), foam = new Float32Array(N * N), TAU = Math.PI * 2;
+  const waves = []; let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  for (let i = 0; i < 22; i++) { const f = 1 + Math.floor(rnd() * (i < 8 ? 4 : 11)), a = rnd() * TAU; waves.push([Math.round(Math.cos(a) * f), Math.round(Math.sin(a) * f), 1 / (0.6 + f), rnd() * TAU]); }
+  const fw = []; for (let i = 0; i < 9; i++) { const f = 3 + Math.floor(rnd() * 9), a = rnd() * TAU; fw.push([Math.round(Math.cos(a) * f), Math.round(Math.sin(a) * f), rnd() * TAU]); }
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const u = x / N * TAU, v = y / N * TAU; let h = 0, f = 0;
+    for (const [kx, ky, a, ph] of waves) { const s = Math.sin(kx * u + ky * v + ph); h += a * (1 - Math.abs(s)) ** 1.6; } // sharp crests
+    for (const [kx, ky, ph] of fw) f += Math.sin(kx * u + ky * v + ph);
+    hgt[y * N + x] = h; foam[y * N + x] = f;
+  }
+  const c = document.createElement('canvas'); c.width = c.height = N; const x2 = c.getContext('2d'), img = x2.createImageData(N, N), d = img.data;
+  let fmin = 1e9, fmax = -1e9; for (const v of foam) { fmin = Math.min(fmin, v); fmax = Math.max(fmax, v); }
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const at = (i, j) => hgt[((j + N) % N) * N + (i + N) % N], k = 2.2;
+    let nx = (at(x - 1, y) - at(x + 1, y)) * k, ny = (at(x, y - 1) - at(x, y + 1)) * k, nz = 1; const l = Math.hypot(nx, ny, nz); nx /= l; ny /= l; nz /= l;
+    const o = (y * N + x) * 4; d[o] = (nx * 0.5 + 0.5) * 255; d[o + 1] = (ny * 0.5 + 0.5) * 255; d[o + 2] = (nz * 0.5 + 0.5) * 255; d[o + 3] = (foam[y * N + x] - fmin) / (fmax - fmin) * 255;
+  }
+  x2.putImageData(img, 0, 0);
+  NORM = new THREE.CanvasTexture(c); NORM.wrapS = NORM.wrapT = THREE.RepeatWrapping; NORM.colorSpace = THREE.NoColorSpace; NORM.premultiplyAlpha = false;
+  NORM.generateMipmaps = true; NORM.minFilter = THREE.LinearMipmapLinearFilter; NORM.anisotropy = 4;
+  return NORM;
+}
+const VERT = `
+attribute float shore;
+varying float vShore; varying vec3 vW;
+#include <common>
+#include <fog_pars_vertex>
+#include <logdepthbuf_pars_vertex>
+void main() {
+  vShore = shore;
+  vec4 wp = modelMatrix * vec4(position, 1.0); vW = wp.xyz;
+  vec4 mvPosition = viewMatrix * wp;
+  gl_Position = projectionMatrix * mvPosition;
+  #include <logdepthbuf_vertex>
+  #include <fog_vertex>
+}`;
+const FRAG = `
+uniform float uTime, uRough; uniform sampler2D uNorm;
+uniform vec3 uSkyTop, uSkyHor, uSunDir, uSunCol, uAmb, uDeep, uShallow;
+varying float vShore; varying vec3 vW;
+#include <common>
+#include <fog_pars_fragment>
+#include <logdepthbuf_pars_fragment>
+vec2 nm(vec2 p) { return texture2D(uNorm, p).xy * 2.0 - 1.0; }
+void main() {
+  #include <logdepthbuf_fragment>
+  vec2 p = vW.xz; float t = uTime;
+  vec3 toCam = cameraPosition - vW; float dist = length(toCam); vec3 V = toCam / dist;
+  // three ripple layers drifting different ways = no visible tiling
+  vec2 n2 = nm(p / 21.0 + vec2(t * 0.013, t * 0.008)) + nm(p / 8.3 + vec2(-t * 0.021, t * 0.017)) * 0.75 + nm(p / 57.0 + vec2(-t * 0.004, -t * 0.007)) * 0.9;
+  float calm = mix(1.0, 0.18, clamp(dist / 700.0, 0.0, 1.0)) * uRough;          // smooth out far away so it doesn't shimmer
+  vec3 n = normalize(vec3(n2.x * 0.34 * calm, 1.0, n2.y * 0.34 * calm));
+  float ndv = max(dot(n, V), 0.0);
+  float fres = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
+  vec3 R = reflect(-V, n); R.y = abs(R.y);
+  float h = clamp(R.y * 1.6 + 0.08, 0.0, 1.0);
+  vec3 sky = mix(uSkyHor, uSkyTop, pow(h, 0.7));
+  // water body: teal in the shallows, deep blue in the middle, lit by the ambient light of the time of day
+  float deep = smoothstep(0.5, 11.0, vShore);
+  vec3 body = mix(uShallow, uDeep, deep) * uAmb;
+  body += uShallow * uAmb * 0.22 * pow(max(dot(uSunDir, n), 0.0), 3.0) * (1.0 - deep * 0.6); // light scattering through the shallows
+  vec3 col = mix(body, sky, clamp(fres * 0.9 + 0.06, 0.0, 1.0));
+  // sun / moon glint: a tight hotspot plus a broad sheen
+  float sd = max(dot(R, uSunDir), 0.0);
+  col += uSunCol * (pow(sd, 420.0) * 5.0 + pow(sd, 48.0) * 0.16) * smoothstep(-0.05, 0.12, uSunDir.y);
+  // foam: lapping lines along the bank that come and go
+  float fn = texture2D(uNorm, p / 4.7 + vec2(t * 0.02, -t * 0.015)).a;
+  float band = 1.0 - smoothstep(0.0, 2.6, vShore);
+  float lap = 0.5 + 0.5 * sin(vShore * 2.4 - t * 1.6 + fn * 4.0);
+  float foam = band * smoothstep(0.38, 0.72, fn * 0.65 + lap * 0.55) + (1.0 - smoothstep(0.0, 0.9, vShore)) * 0.65;
+  col = mix(col, vec3(0.93, 0.96, 0.97) * (uAmb * 0.85 + 0.08), clamp(foam, 0.0, 0.9));
+  gl_FragColor = vec4(col, 1.0);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+  #include <fog_fragment>
+}`;
+export function waterMaterial() {
+  if (MAT) return MAT;
+  U.uNorm.value = normalTexture();
+  MAT = new THREE.ShaderMaterial({ uniforms: THREE.UniformsUtils.merge([THREE.UniformsLib.fog, {}]), vertexShader: VERT, fragmentShader: FRAG, fog: true, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
+  Object.assign(MAT.uniforms, U); // share the live uniform objects so updateWater() reaches them
+  return MAT;
+}
+// Call once a frame from the game loop. sky = the sky dome's { top, bottom } colours, sun = the DirectionalLight, hemi = the HemisphereLight.
+const _sky = new THREE.Color(), _a = new THREE.Color(), _d = new THREE.Vector3();
+export function updateWater(dt, { sun, hemi, skyTop, skyBottom, calm = false } = {}) {
+  U.uTime.value = (U.uTime.value + dt) % 3600;
+  U.uRough.value = calm ? 0.7 : 1;
+  // the sky dome writes its colours straight to the screen; undo the output conversion so the reflection matches it
+  if (skyTop) U.uSkyTop.value.copy(_sky.copy(skyTop).convertSRGBToLinear());
+  if (skyBottom) U.uSkyHor.value.copy(_sky.copy(skyBottom).convertSRGBToLinear());
+  if (sun) {
+    _d.copy(sun.position).sub(sun.target.position).normalize(); U.uSunDir.value.copy(_d);
+    U.uSunCol.value.copy(sun.color).multiplyScalar(Math.min(2.2, sun.intensity));
+    _a.copy(hemi ? hemi.color : sun.color).multiplyScalar(hemi ? hemi.intensity * 0.75 : 0.6).add(_sky.copy(sun.color).multiplyScalar(sun.intensity * 0.32 * Math.max(0, _d.y)));
+    U.uAmb.value.copy(_a);
+  }
+}
+
+// the light on the water right now (ambient of the time of day), for effects that should match it
+export const waterAmbient = () => U.uAmb.value;
